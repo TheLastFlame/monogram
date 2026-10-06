@@ -73,6 +73,9 @@ pub(crate) struct ClientData {
     pub(crate) persist_epoch: u64,
     pub(crate) persisted_epoch: u64,
     pub(crate) is_syncing: bool,
+    pub(crate) lazy_channel_updates: bool,
+    pub(crate) lazy_sync_exceptions: HashSet<i64>,
+    pub(crate) lazy_channel_recovery: HashSet<i64>,
 }
 
 #[derive(Clone)]
@@ -269,6 +272,9 @@ pub fn create_client(api_id: i32, api_hash: String, session_path: String) -> u64
                 persist_epoch: 0,
                 persisted_epoch: 0,
                 is_syncing: false,
+                lazy_channel_updates: false,
+                lazy_sync_exceptions: HashSet::new(),
+                lazy_channel_recovery: HashSet::new(),
             }),
             main_gate: scheduler::LaneGate::new(),
             main: Mutex::new(SessionIo {
@@ -365,6 +371,14 @@ pub fn client_api_id(handle: u64) -> i32 {
     get_client(handle)
         .map(|c| c.data.lock().api_id)
         .unwrap_or(0)
+}
+
+pub fn update_lazy_sync_config(handle: u64, lazy: bool, exceptions: Vec<i64>) {
+    if let Ok(client) = get_client(handle) {
+        let mut d = client.data.lock();
+        d.lazy_channel_updates = lazy;
+        d.lazy_sync_exceptions = exceptions.into_iter().collect();
+    }
 }
 
 pub(crate) fn with_client_mut<T>(
