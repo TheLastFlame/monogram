@@ -1237,3 +1237,8 @@ pub fn finish_waveform(handle: u64) -> Result<Vec<f32>, MtprotoError> {
 pub fn destroy_waveform(handle: u64) {
     waveform::destroy(handle)
 }
+
+#[uniffi::export]
+pub fn suspend_media_transports(handle: u64) -> Result<(), MtprotoError> {
+    client::suspend_media_transports(handle)
+}

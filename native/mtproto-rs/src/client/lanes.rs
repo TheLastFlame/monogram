@@ -153,22 +153,11 @@ pub(crate) fn lock_media_lane(client: &Client) -> Result<LaneLease<'_>, MtprotoE
     }
 }
 
-pub(crate) fn close_idle_file_transports(client: &Client, now: std::time::Instant) -> bool {
-    let mut pending = false;
-    let mut close = |lane: &Mutex<SessionIo>| {
-        let Some(mut io) = lane.try_lock() else {
-            pending = true;
-            return;
-        };
-        if let Some(transport) = io.transport.as_ref() {
-            if now.saturating_duration_since(transport.last_io)
-                >= crate::media::DOWNLOAD_SESSION_IDLE
-            {
-                if let Some(mut transport) = io.transport.take() {
-                    let _ = transport.conn.close();
-                }
-            } else {
-                pending = true;
+pub fn suspend_media_transports(client: &Client) {
+    let close = |lane: &Mutex<SessionIo>| {
+        if let Some(mut io) = lane.try_lock() {
+            if let Some(mut transport) = io.transport.take() {
+                let _ = transport.conn.close();
             }
         }
     };
@@ -176,10 +165,7 @@ pub(crate) fn close_idle_file_transports(client: &Client, now: std::time::Instan
         close(&lane.io);
     }
     close(&client.upload);
-    if !pending {
-        client.media_open.store(1, Ordering::Release);
-    }
-    pending
+    client.media_open.store(1, Ordering::Release);
 }
 
 pub(crate) fn schedule_file_cleanup(client: &Arc<Client>) {
@@ -192,19 +178,16 @@ pub(crate) fn schedule_file_cleanup(client: &Arc<Client>) {
         .spawn(move || {
             let ack_due = std::time::Instant::now() + crate::rpc::ACK_DELAY;
             loop {
-                std::thread::sleep(crate::media::DOWNLOAD_SESSION_IDLE);
+                std::thread::sleep(std::time::Duration::from_secs(2));
                 let Some(client) = weak.upgrade() else {
                     break;
                 };
                 let now = std::time::Instant::now();
-                let files_pending = close_idle_file_transports(&client, now);
-                if flush_idle_main_acks(&client, now, ack_due) || files_pending {
+                if flush_idle_main_acks(&client, now, ack_due) {
                     continue;
                 }
                 client.file_cleanup_running.store(false, Ordering::Release);
-                // A transfer may have finished while the worker cleared its flag.
-                if (close_idle_file_transports(&client, std::time::Instant::now())
-                    || flush_idle_main_acks(&client, std::time::Instant::now(), ack_due))
+                if flush_idle_main_acks(&client, std::time::Instant::now(), ack_due)
                     && !client.file_cleanup_running.swap(true, Ordering::AcqRel)
                 {
                     continue;

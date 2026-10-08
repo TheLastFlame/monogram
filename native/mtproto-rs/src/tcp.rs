@@ -114,9 +114,7 @@ impl TcpConnection {
     pub fn set_io_timeout_ms(&mut self, ms: u64) {
         let timeout = Duration::from_millis(ms.max(50));
         self.read_timeout = timeout;
-        let _ = self
-            .stream
-            .set_read_timeout(Some(timeout.min(Duration::from_millis(250))));
+        let _ = self.stream.set_read_timeout(Some(timeout));
         let _ = self.stream.set_write_timeout(Some(timeout));
     }
 
@@ -140,19 +138,11 @@ impl Connection for TcpConnection {
     }
 
     fn receive(&mut self, output: &mut [u8]) -> Result<usize, TransportError> {
+        check_open()?;
         crate::request_control::register(&self.stream)?;
-        let deadline = std::time::Instant::now() + self.read_timeout;
-        loop {
-            check_open()?;
-            match self.inner.receive(output) {
-                Ok(result) => return Ok(result),
-                Err(error) if std::time::Instant::now() < deadline => {
-                    let _ = error;
-                    continue;
-                }
-                Err(error) => return Err(TransportError::Connection(error.to_string())),
-            }
-        }
+        self.inner
+            .receive(output)
+            .map_err(|e| TransportError::Connection(e.to_string()))
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -178,17 +168,18 @@ impl ObfuscatedTcp {
     }
 
     pub fn set_io_timeout_ms(&mut self, ms: u64) {
-        self.read_timeout = Duration::from_millis(ms.max(50));
-        let read = self.read_timeout.min(Duration::from_millis(250));
+        let timeout = Duration::from_millis(ms.max(50));
+        self.read_timeout = timeout;
         let _ = match &mut self.inner {
             NativeTransportConnection::Obfuscated(connection) => connection.set_io_timeout_ms(ms),
             NativeTransportConnection::Http(connection) => connection.set_io_timeout_ms(ms),
         };
         let _ = match &mut self.inner {
-            NativeTransportConnection::Obfuscated(connection) => connection.set_read_timeout(read),
-            NativeTransportConnection::Http(connection) => connection.set_read_timeout(read),
+            NativeTransportConnection::Obfuscated(connection) => connection.set_read_timeout(timeout),
+            NativeTransportConnection::Http(connection) => connection.set_read_timeout(timeout),
         };
-        let _ = self.stream.set_read_timeout(Some(read));
+        let _ = self.stream.set_read_timeout(Some(timeout));
+        let _ = self.stream.set_write_timeout(Some(timeout));
     }
 }
 
@@ -204,25 +195,17 @@ impl Connection for ObfuscatedTcp {
     }
 
     fn receive(&mut self, output: &mut [u8]) -> Result<usize, TransportError> {
+        check_open()?;
         crate::request_control::register(&self.stream)?;
-        let deadline = std::time::Instant::now() + self.read_timeout;
-        loop {
-            check_open()?;
-            match match &mut self.inner {
-                NativeTransportConnection::Obfuscated(connection) => connection.receive(output),
-                NativeTransportConnection::Http(connection) => connection.receive(output),
-            } {
-                Ok(result) => return Ok(result),
-                Err(error) if std::time::Instant::now() < deadline => {
-                    let _ = error;
-                    continue;
-                }
-                Err(error) => return Err(TransportError::Connection(error.to_string())),
-            }
+        match &mut self.inner {
+            NativeTransportConnection::Obfuscated(connection) => connection.receive(output),
+            NativeTransportConnection::Http(connection) => connection.receive(output),
         }
+        .map_err(|error| TransportError::Connection(error.to_string()))
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         match &mut self.inner {
             NativeTransportConnection::Obfuscated(connection) => connection.close(),
             NativeTransportConnection::Http(connection) => connection.close(),

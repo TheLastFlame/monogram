@@ -836,3 +836,9 @@ pub(crate) fn update_lazy_sync_config(handle: u64, lazy: bool, exceptions: Vec<i
         });
     }
 }
+
+pub fn suspend_media_transports(handle: u64) -> Result<(), MtprotoError> {
+    let client = get_client(handle)?;
+    lanes::suspend_media_transports(&client);
+    Ok(())
+}
