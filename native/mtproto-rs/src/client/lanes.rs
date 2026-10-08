@@ -65,9 +65,10 @@ impl Lane {
 
     pub(crate) fn try_lease(&self, class: crate::scheduler::RequestClass) -> Option<LaneLease<'_>> {
         let gate = self.gate.try_acquire(class)?;
+        let io = self.io.try_lock()?;
         Some(LaneLease {
             _gate: gate,
-            io: self.io.lock(),
+            io,
         })
     }
 
@@ -151,6 +152,34 @@ pub(crate) fn lock_media_lane(client: &Client) -> Result<LaneLease<'_>, MtprotoE
             "read class on the media family".into(),
         )),
     }
+}
+
+pub(crate) fn try_lock_media_lane(client: &Client) -> Option<LaneLease<'_>> {
+    let class = scheduler::current_class();
+    if scheduler::family(class) != scheduler::LaneFamily::Media {
+        return None;
+    }
+    let cap = client.policy.media_lanes();
+    let open = client.media_open.load(Ordering::Acquire).min(cap);
+    for lane in client.media.iter().take(open) {
+        if let Some(lease) = lane.try_lease(class) {
+            return Some(lease);
+        }
+    }
+    if open < cap {
+        if client
+            .media_open
+            .compare_exchange(open, open + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if let Some(lane) = client.media.get(open) {
+                if let Some(lease) = lane.try_lease(class) {
+                    return Some(lease);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn suspend_media_transports(client: &Client) {

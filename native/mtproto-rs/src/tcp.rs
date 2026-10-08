@@ -170,15 +170,16 @@ impl ObfuscatedTcp {
     pub fn set_io_timeout_ms(&mut self, ms: u64) {
         let timeout = Duration::from_millis(ms.max(50));
         self.read_timeout = timeout;
+        let read = timeout.min(Duration::from_millis(1000));
         let _ = match &mut self.inner {
             NativeTransportConnection::Obfuscated(connection) => connection.set_io_timeout_ms(ms),
             NativeTransportConnection::Http(connection) => connection.set_io_timeout_ms(ms),
         };
         let _ = match &mut self.inner {
-            NativeTransportConnection::Obfuscated(connection) => connection.set_read_timeout(timeout),
-            NativeTransportConnection::Http(connection) => connection.set_read_timeout(timeout),
+            NativeTransportConnection::Obfuscated(connection) => connection.set_read_timeout(read),
+            NativeTransportConnection::Http(connection) => connection.set_read_timeout(read),
         };
-        let _ = self.stream.set_read_timeout(Some(timeout));
+        let _ = self.stream.set_read_timeout(Some(read));
         let _ = self.stream.set_write_timeout(Some(timeout));
     }
 }
@@ -195,13 +196,22 @@ impl Connection for ObfuscatedTcp {
     }
 
     fn receive(&mut self, output: &mut [u8]) -> Result<usize, TransportError> {
-        check_open()?;
         crate::request_control::register(&self.stream)?;
-        match &mut self.inner {
-            NativeTransportConnection::Obfuscated(connection) => connection.receive(output),
-            NativeTransportConnection::Http(connection) => connection.receive(output),
+        let deadline = std::time::Instant::now() + self.read_timeout;
+        loop {
+            check_open()?;
+            match match &mut self.inner {
+                NativeTransportConnection::Obfuscated(connection) => connection.receive(output),
+                NativeTransportConnection::Http(connection) => connection.receive(output),
+            } {
+                Ok(result) => return Ok(result),
+                Err(error) if std::time::Instant::now() < deadline => {
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => return Err(TransportError::Connection(error.to_string())),
+            }
         }
-        .map_err(|error| TransportError::Connection(error.to_string()))
     }
 
     fn close(&mut self) -> Result<(), TransportError> {

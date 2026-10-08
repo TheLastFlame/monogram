@@ -685,21 +685,9 @@ pub(crate) fn download_media_range_on_lane(
     loop {
         media::check_transfer_flood(target_dc, media::TransferClass::Download)?;
         let admission = client.policy.admit_download(target_dc, large)?;
-        let first = if target_dc == home.dc_id {
-            download_media_range_on_home_session(
-                handle,
-                client,
-                home.session_id,
-                api_id,
-                media,
-                dest,
-                offset,
-            )
-        } else {
-            download_media_range_on_lane_dc(
-                handle, client, home, api_id, media, dest, offset, target_dc,
-            )
-        };
+        let first = download_media_range_on_lane_dc(
+            handle, client, home, api_id, media, dest, offset, target_dc,
+        );
         if let Err(ref error) = first {
             if let Some(dc) = api_invoke::migrate_dc(error) {
                 if dc != target_dc && migrations < 3 {
@@ -727,21 +715,9 @@ pub(crate) fn download_media_range_on_lane(
                     Ok(path) => Ok(path),
                     Err(_) => media::with_cdn_supported(false, || {
                         let _admission = client.policy.admit_download(target_dc, large)?;
-                        if target_dc == home.dc_id {
-                            download_media_range_on_home_session(
-                                handle,
-                                client,
-                                home.session_id,
-                                api_id,
-                                media,
-                                dest,
-                                offset,
-                            )
-                        } else {
-                            download_media_range_on_lane_dc(
-                                handle, client, home, api_id, media, dest, offset, target_dc,
-                            )
-                        }
+                        download_media_range_on_lane_dc(
+                            handle, client, home, api_id, media, dest, offset, target_dc,
+                        )
                     }),
                 }
             }
@@ -921,8 +897,12 @@ pub(crate) fn download_media_range_on_lane_dc(
     let _span = crate::perf::span("media_file");
     let staged = media::StagedDownload::new(dest)?;
     let mut io = lock_media_lane(client)?;
-    // A file owns one session and pipelines at most eight parts on it.
-    let mut io2: Option<LaneLease<'_>> = None;
+    // Try to lease a second lane if available for parallel chunk downloading.
+    let mut io2: Option<LaneLease<'_>> = if media.file_size.is_none() || media.file_size.unwrap_or(0) > 128 * 1024 {
+        try_lock_media_lane(client)
+    } else {
+        None
+    };
     if !session_lease_valid(&client.data.lock(), home.session_id) {
         return Err(expired_session_lease());
     }
@@ -942,7 +922,7 @@ pub(crate) fn download_media_range_on_lane_dc(
     if let Some(second) = io2.as_mut() {
         match prepare_media_lane_snapshot(&mut second.snapshot, home, target_dc) {
             MediaLanePrep::NeedExport => {
-                second.snapshot = io.snapshot.clone();
+                second.snapshot = fork_session(&io.snapshot);
                 second.transport = None;
             }
             MediaLanePrep::Replaced => second.transport = None,

@@ -144,10 +144,21 @@ pub(crate) fn bound_download_window() -> Option<DownloadWindow> {
 pub(crate) fn configured_download_window(profile: DownloadProfile) -> DownloadWindow {
     let maximum = download_window(profile);
     let policy = crate::transfer_policy::current();
-    DownloadWindow {
-        chunk: maximum.chunk.min(policy.chunk_size()),
-        in_flight: maximum.in_flight.min(policy.pipeline_parts()),
-    }
+    let chunk = if policy.is_chunk_owned() {
+        maximum.chunk.min(policy.chunk_size())
+    } else if maximum.chunk >= FAST_CHUNK {
+        maximum.chunk
+    } else {
+        maximum.chunk.min(policy.chunk_size())
+    };
+    let in_flight = if policy.is_pipeline_owned() {
+        maximum.in_flight.min(policy.pipeline_parts())
+    } else if maximum.in_flight >= 8 {
+        maximum.in_flight
+    } else {
+        maximum.in_flight.min(policy.pipeline_parts())
+    };
+    DownloadWindow { chunk, in_flight }
 }
 
 pub(crate) fn download_in_flight() -> usize {

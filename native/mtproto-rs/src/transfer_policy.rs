@@ -10,11 +10,24 @@ use crate::HashMapExt;
 use parking_lot::RwLock;
 
 use crate::client::{DEFAULT_PIPELINE_PARTS, MAX_PIPELINE_PARTS};
-use crate::media::DEFAULT_CHUNK;
+use crate::media::{DEFAULT_CHUNK, FAST_CHUNK};
 use crate::scheduler::{DEFAULT_MEDIA_LANES, MAX_MEDIA_LANES};
 use crate::upload::upload_rpc::{FILE_PART_FAST, FILE_PART_SMALL};
 
 pub type ProgressCallback = Arc<dyn Fn(&str, i64, i64) + Send + Sync + 'static>;
+
+#[derive(Default)]
+struct DownloadQueueState {
+    next_ticket: u64,
+    waiters: std::collections::VecDeque<DownloadWaiter>,
+}
+
+struct DownloadWaiter {
+    ticket: u64,
+    priority: u8,
+    dc: i32,
+    large: bool,
+}
 
 pub(crate) struct TransferPolicy {
     media_lanes: AtomicUsize,
@@ -28,6 +41,7 @@ pub(crate) struct TransferPolicy {
     pub(crate) queue_limits: parking_lot::Mutex<(usize, usize)>,
     downloads: parking_lot::Mutex<crate::HashMap<(i32, bool), usize>>,
     download_wake: parking_lot::Condvar,
+    download_waiters: parking_lot::Mutex<DownloadQueueState>,
     pub(crate) upload_rtt:
         parking_lot::Mutex<Option<(i32, std::time::Instant, std::time::Duration)>>,
     pub(crate) config_due: std::sync::atomic::AtomicU64,
@@ -52,6 +66,7 @@ impl TransferPolicy {
             queue_limits: parking_lot::Mutex::new((5, 2)),
             downloads: parking_lot::Mutex::new(crate::HashMap::new()),
             download_wake: parking_lot::Condvar::new(),
+            download_waiters: parking_lot::Mutex::new(DownloadQueueState::default()),
             upload_rtt: parking_lot::Mutex::new(None),
             config_due: std::sync::atomic::AtomicU64::new(0),
             media_lanes_owned: AtomicBool::new(false),
@@ -82,14 +97,53 @@ impl TransferPolicy {
         dc: i32,
         large: bool,
     ) -> Result<DownloadAdmission, crate::MtprotoError> {
+        let class = crate::scheduler::current_class();
+        let priority = class.priority();
+        let ticket = {
+            let mut q = self.download_waiters.lock();
+            let t = q.next_ticket;
+            q.next_ticket += 1;
+            q.waiters.push_back(DownloadWaiter {
+                ticket: t,
+                priority,
+                dc,
+                large,
+            });
+            t
+        };
+        struct QueueGuard<'a> {
+            policy: &'a TransferPolicy,
+            ticket: u64,
+        }
+        impl Drop for QueueGuard<'_> {
+            fn drop(&mut self) {
+                let mut q = self.policy.download_waiters.lock();
+                q.waiters.retain(|w| w.ticket != self.ticket);
+                self.policy.download_wake.notify_all();
+            }
+        }
+        let _guard = QueueGuard {
+            policy: self.as_ref(),
+            ticket,
+        };
+
         let mut active = self.downloads.lock();
         loop {
             crate::request_control::check()
                 .map_err(|e| crate::MtprotoError::Message(e.to_string()))?;
+            let is_best = {
+                let q = self.download_waiters.lock();
+                q.waiters
+                    .iter()
+                    .filter(|w| w.dc == dc && w.large == large)
+                    .min_by_key(|w| (w.priority, w.ticket))
+                    .map(|w| w.ticket)
+                    == Some(ticket)
+            };
             let limits = *self.queue_limits.lock();
             let limit = if large { limits.1.min(2) } else { limits.0 };
             let count = active.entry((dc, large)).or_insert(0);
-            if *count < limit.max(1) {
+            if is_best && *count < limit {
                 *count += 1;
                 return Ok(DownloadAdmission {
                     policy: self.clone(),
@@ -190,6 +244,14 @@ impl TransferPolicy {
     pub(crate) fn own_chunk_size(&self, size: i32) {
         self.chunk_owned.store(true, Ordering::Relaxed);
         self.assign_chunk_size(size);
+    }
+
+    pub(crate) fn is_chunk_owned(&self) -> bool {
+        self.chunk_owned.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_pipeline_owned(&self) -> bool {
+        self.pipeline_owned.load(Ordering::Relaxed)
     }
 
     pub(crate) fn own_file_part_kib(&self, kib: i32) {

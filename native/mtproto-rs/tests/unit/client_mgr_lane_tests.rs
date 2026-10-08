@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn download_sessions_grow_from_one_to_eight_and_reset_after_idle() {
+fn download_sessions_grow_from_one_to_eight_and_reset_on_suspend() {
     let path = std::env::temp_dir().join(format!("monogram-growth-{}.json", std::process::id()));
     let handle = create_client(1, "hash".into(), path.to_string_lossy().into());
     let client = get_client(handle).unwrap();
@@ -13,16 +13,10 @@ fn download_sessions_grow_from_one_to_eight_and_reset_after_idle() {
             leases.push(lock_media_lane(&client).unwrap());
             assert_eq!(client.media_open.load(Ordering::Acquire), expected);
         }
-        assert!(close_idle_file_transports(
-            &client,
-            std::time::Instant::now()
-        ));
-        assert_eq!(client.media_open.load(Ordering::Acquire), 8);
+        lanes::suspend_media_transports(&client);
+        assert_eq!(client.media_open.load(Ordering::Acquire), 1);
         drop(leases);
-        assert!(!close_idle_file_transports(
-            &client,
-            std::time::Instant::now()
-        ));
+        lanes::suspend_media_transports(&client);
         assert_eq!(client.media_open.load(Ordering::Acquire), 1);
     });
     destroy_client(handle);
@@ -595,14 +589,12 @@ fn idle_file_cleanup_closes_sockets_and_preserves_busy_lanes_and_main() {
     client.media[0].io.lock().transport = Some(media);
     client.upload.lock().transport = Some(upload);
     client.main.lock().transport = Some(main);
-    assert!(close_idle_file_transports(&client, now));
     let busy = client.media[0].io.lock();
-    let later = now + crate::media::DOWNLOAD_SESSION_IDLE;
-    assert!(close_idle_file_transports(&client, later));
+    lanes::suspend_media_transports(&client);
     assert!(busy.transport.is_some());
     assert!(client.upload.lock().transport.is_none());
     drop(busy);
-    assert!(!close_idle_file_transports(&client, later));
+    lanes::suspend_media_transports(&client);
     assert!(client.media[0].io.lock().transport.is_none());
     assert!(client.main.lock().transport.is_some());
     for peer in [&mut media_peer, &mut upload_peer] {
