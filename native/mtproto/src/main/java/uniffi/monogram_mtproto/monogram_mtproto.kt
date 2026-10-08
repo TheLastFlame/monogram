@@ -950,6 +950,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_monogram_mtproto_checksum_func_start_updates(
     ): Int
+    external fun uniffi_monogram_mtproto_checksum_func_suspend_media_transports(
+    ): Int
     external fun uniffi_monogram_mtproto_checksum_func_toggle_todo_completed(
     ): Int
     external fun uniffi_monogram_mtproto_checksum_func_unregister_device(
@@ -1237,6 +1239,8 @@ internal object UniffiLib {
     external fun uniffi_monogram_mtproto_fn_func_sign_in(`handle`: Long,`phone`: RustBuffer.ByValue,`phoneCodeHash`: RustBuffer.ByValue,`phoneCode`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_monogram_mtproto_fn_func_start_updates(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_monogram_mtproto_fn_func_suspend_media_transports(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_monogram_mtproto_fn_func_toggle_todo_completed(`handle`: Long,`chatId`: Long,`messageId`: Int,`completed`: RustBuffer.ByValue,`incompleted`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
@@ -1753,6 +1757,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_monogram_mtproto_checksum_func_start_updates() and 0xFFFF) != 56295) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_monogram_mtproto_checksum_func_suspend_media_transports() and 0xFFFF) != 9533) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_monogram_mtproto_checksum_func_toggle_todo_completed() and 0xFFFF) != 1354) {
@@ -7866,6 +7873,17 @@ public object FfiConverterSequenceTypeUpdateEventDto: FfiConverterRustBuffer<Lis
         =
     uniffiRustCallWithError(MtprotoException) { _status ->
     UniffiLib.uniffi_monogram_mtproto_fn_func_start_updates(
+
+
+        FfiConverterULong.lower(`handle`),_status)
+}
+
+
+
+    @Throws(MtprotoException::class) fun `suspendMediaTransports`(`handle`: kotlin.ULong)
+        =
+    uniffiRustCallWithError(MtprotoException) { _status ->
+    UniffiLib.uniffi_monogram_mtproto_fn_func_suspend_media_transports(
 
 
         FfiConverterULong.lower(`handle`),_status)
