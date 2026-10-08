@@ -685,9 +685,21 @@ pub(crate) fn download_media_range_on_lane(
     loop {
         media::check_transfer_flood(target_dc, media::TransferClass::Download)?;
         let admission = client.policy.admit_download(target_dc, large)?;
-        let first = download_media_range_on_lane_dc(
-            handle, client, home, api_id, media, dest, offset, target_dc,
-        );
+        let first = if target_dc == home.dc_id {
+            download_media_range_on_home_session(
+                handle,
+                client,
+                home.session_id,
+                api_id,
+                media,
+                dest,
+                offset,
+            )
+        } else {
+            download_media_range_on_lane_dc(
+                handle, client, home, api_id, media, dest, offset, target_dc,
+            )
+        };
         if let Err(ref error) = first {
             if let Some(dc) = api_invoke::migrate_dc(error) {
                 if dc != target_dc && migrations < 3 {
@@ -715,9 +727,21 @@ pub(crate) fn download_media_range_on_lane(
                     Ok(path) => Ok(path),
                     Err(_) => media::with_cdn_supported(false, || {
                         let _admission = client.policy.admit_download(target_dc, large)?;
-                        download_media_range_on_lane_dc(
-                            handle, client, home, api_id, media, dest, offset, target_dc,
-                        )
+                        if target_dc == home.dc_id {
+                            download_media_range_on_home_session(
+                                handle,
+                                client,
+                                home.session_id,
+                                api_id,
+                                media,
+                                dest,
+                                offset,
+                            )
+                        } else {
+                            download_media_range_on_lane_dc(
+                                handle, client, home, api_id, media, dest, offset, target_dc,
+                            )
+                        }
                     }),
                 }
             }
@@ -795,95 +819,6 @@ pub(crate) fn split_even_odd_request_indices(
     (even, odd)
 }
 
-fn invoke_lane_batch(
-    client: &Client,
-    snapshot: &mut tellers_mtproto_session::Snapshot,
-    slot: &mut Option<crate::rpc::LiveTransport>,
-    api_id: i32,
-    requests: Vec<tellers_mtproto::latest::api::UploadGetFileRequest>,
-) -> Result<Vec<Result<tellers_mtproto::latest::api::UploadFile, MtprotoError>>, MtprotoError> {
-    with_client_transport(client, slot, || {
-        crate::api_invoke::invoke_api_batch_without_updates_streaming::<
-            _,
-            tellers_mtproto::latest::api::UploadFile,
-        >(snapshot, api_id, requests, &mut |_, _| None)
-    })
-}
-
-fn invoke_media_batch_even_odd(
-    client: &Client,
-    snap_a: &mut tellers_mtproto_session::Snapshot,
-    slot_a: &mut Option<crate::rpc::LiveTransport>,
-    snap_b: Option<&mut tellers_mtproto_session::Snapshot>,
-    slot_b: Option<&mut Option<crate::rpc::LiveTransport>>,
-    api_id: i32,
-    requests: Vec<tellers_mtproto::latest::api::UploadGetFileRequest>,
-    on_chunk: &mut dyn FnMut(
-        usize,
-        Result<tellers_mtproto::latest::api::UploadFile, MtprotoError>,
-    ) -> Option<tellers_mtproto::latest::api::UploadGetFileRequest>,
-) -> Result<Vec<Result<tellers_mtproto::latest::api::UploadFile, MtprotoError>>, MtprotoError> {
-    let Some(first) = requests.first() else {
-        return Ok(Vec::new());
-    };
-    let offsets: Vec<i64> = requests.iter().map(|r| r.offset).collect();
-    let (even_idx, odd_idx) = split_even_odd_request_indices(&offsets, first.limit);
-    let even_reqs: Vec<_> = even_idx.iter().map(|i| requests[*i].clone()).collect();
-    let odd_reqs: Vec<_> = odd_idx.iter().map(|i| requests[*i].clone()).collect();
-    if snap_b.is_none() || slot_b.is_none() || odd_reqs.is_empty() || even_reqs.is_empty() {
-        return with_client_transport(client, slot_a, || {
-            crate::api_invoke::invoke_api_batch_without_updates_streaming(
-                snap_a, api_id, requests, on_chunk,
-            )
-        });
-    }
-    let snap_b = snap_b.unwrap();
-    let slot_b = slot_b.unwrap();
-    let mut snap_a_t = snap_a.clone();
-    let mut snap_b_t = snap_b.clone();
-    let mut slot_a_t = slot_a.take();
-    let mut slot_b_t = slot_b.take();
-    let joined = std::thread::scope(|scope| {
-        let even_h = scope
-            .spawn(|| invoke_lane_batch(client, &mut snap_a_t, &mut slot_a_t, api_id, even_reqs));
-        let odd_h = scope
-            .spawn(|| invoke_lane_batch(client, &mut snap_b_t, &mut slot_b_t, api_id, odd_reqs));
-        (even_h.join(), odd_h.join())
-    });
-    *snap_a = snap_a_t;
-    *snap_b = snap_b_t;
-    *slot_a = slot_a_t;
-    *slot_b = slot_b_t;
-    let even_res = joined
-        .0
-        .map_err(|_| MtprotoError::Message("even media lane".into()))??;
-    let odd_res = joined
-        .1
-        .map_err(|_| MtprotoError::Message("odd media lane".into()))??;
-    let mut merged: Vec<Option<Result<tellers_mtproto::latest::api::UploadFile, MtprotoError>>> =
-        (0..requests.len()).map(|_| None).collect();
-    for (slot, result) in even_idx.into_iter().zip(even_res) {
-        merged[slot] = Some(result);
-    }
-    for (slot, result) in odd_idx.into_iter().zip(odd_res) {
-        merged[slot] = Some(result);
-    }
-    let mut out = Vec::with_capacity(merged.len());
-    for (index, item) in merged.into_iter().enumerate() {
-        let item = item.unwrap_or_else(|| Err(MtprotoError::Message("missing media part".into())));
-        match &item {
-            Ok(file) => {
-                let _ = on_chunk(index, Ok(file.clone()));
-            }
-            Err(err) => {
-                let _ = on_chunk(index, Err(err.clone()));
-            }
-        }
-        out.push(item);
-    }
-    Ok(out)
-}
-
 pub(crate) fn download_media_range_on_lane_dc(
     handle: u64,
     client: &Client,
@@ -897,12 +832,6 @@ pub(crate) fn download_media_range_on_lane_dc(
     let _span = crate::perf::span("media_file");
     let staged = media::StagedDownload::new(dest)?;
     let mut io = lock_media_lane(client)?;
-    // Try to lease a second lane if available for parallel chunk downloading.
-    let mut io2: Option<LaneLease<'_>> = if media.file_size.is_none() || media.file_size.unwrap_or(0) > 128 * 1024 {
-        try_lock_media_lane(client)
-    } else {
-        None
-    };
     if !session_lease_valid(&client.data.lock(), home.session_id) {
         return Err(expired_session_lease());
     }
@@ -919,20 +848,8 @@ pub(crate) fn download_media_range_on_lane_dc(
         MediaLanePrep::Replaced => io.transport = None,
         MediaLanePrep::Reuse => {}
     }
-    if let Some(second) = io2.as_mut() {
-        match prepare_media_lane_snapshot(&mut second.snapshot, home, target_dc) {
-            MediaLanePrep::NeedExport => {
-                second.snapshot = fork_session(&io.snapshot);
-                second.transport = None;
-            }
-            MediaLanePrep::Replaced => second.transport = None,
-            MediaLanePrep::Reuse => {}
-        }
-    }
     let mut media_snap = io.snapshot.clone();
     let mut slot = io.transport.take();
-    let mut media_snap2 = io2.as_ref().map(|lane| lane.snapshot.clone());
-    let mut slot2 = io2.as_mut().map(|lane| lane.transport.take());
     crate::rpc::clear_new_session_metadata();
     // Timeout is per window, not the whole file. Streaming idle-extends while parts arrive.
     let path = {
@@ -947,16 +864,12 @@ pub(crate) fn download_media_range_on_lane_dc(
             |_init_first, requests, on_chunk| {
                 media::check_transfer_flood(lane_dc, media::TransferClass::Download)?;
                 crate::rpc::with_rpc_timeout_secs(45, || {
-                    invoke_media_batch_even_odd(
-                        client,
-                        &mut media_snap,
-                        &mut slot,
-                        media_snap2.as_mut(),
-                        slot2.as_mut(),
-                        api_id,
-                        requests,
-                        on_chunk,
-                    )
+                    with_client_transport(client, &mut slot, || {
+                        crate::api_invoke::invoke_api_batch_without_updates_streaming::<
+                            _,
+                            tellers_mtproto::latest::api::UploadFile,
+                        >(&mut media_snap, api_id, requests, on_chunk)
+                    })
                 })
             },
         )
@@ -964,14 +877,7 @@ pub(crate) fn download_media_range_on_lane_dc(
     io.snapshot = media_snap.clone();
     // FILE_REFERENCE / transport errors must not park this TCP for the next file.
     io.transport = if path.is_ok() { slot } else { None };
-    if let Some(second) = io2.as_mut() {
-        if let Some(snap2) = media_snap2 {
-            second.snapshot = snap2;
-        }
-        second.transport = if path.is_ok() { slot2.flatten() } else { None };
-    }
     drop(io);
-    drop(io2);
     if let Ok(client) = get_client(handle) {
         schedule_file_cleanup(&client);
     }

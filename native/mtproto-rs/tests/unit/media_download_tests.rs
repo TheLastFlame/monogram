@@ -968,3 +968,59 @@ fn capped_refill_releases_fetch_batch_before_eof() {
     assert_eq!(fs::read(&path).unwrap().len(), file_size as usize);
     fs::remove_file(&path).ok();
 }
+
+#[test]
+fn incomplete_download_with_expected_file_size_fails_and_cleans_up() {
+    use tellers_mtproto::latest::api::{
+        StorageFileType, StorageFileUnknownConstructor, UploadFileConstructor,
+    };
+    let expected_size = 500_000i64;
+    let media = MediaRef {
+        file_size: Some(expected_size),
+        kind: "document".into(),
+        cache_key: "incomplete-test".into(),
+        location: MediaLocation::Document {
+            id: 1,
+            access_hash: 2,
+            file_reference: vec![1, 2, 3],
+            thumb_size: String::new(),
+            dc_id: 2,
+            mime_type: "video/mp4".into(),
+        },
+        thumb_cache_key: None,
+        thumb_location: None,
+        display_cache_key: None,
+        display_location: None,
+        sticker_set_id: None,
+        sticker_set_access_hash: None,
+        source_url: None,
+    };
+    let path = std::env::temp_dir().join(format!("monogram-incomplete-{}", std::process::id()));
+    let result = download_media_range_batched_streaming_capped(
+        2,
+        &media,
+        &path,
+        &path,
+        None,
+        2,
+        None,
+        |_init, requests, _on_chunk| {
+            // Server returns only 100_000 bytes and then claims EOF by returning empty/short
+            let mut results = Vec::new();
+            for req in requests {
+                let file = UploadFile::UploadFile(UploadFileConstructor {
+                    type_: Box::new(StorageFileType::StorageFileUnknown(
+                        StorageFileUnknownConstructor {},
+                    )),
+                    mtime: 0,
+                    bytes: if req.offset == 0 { vec![7u8; 100_000] } else { vec![] },
+                });
+                results.push(Ok(file));
+            }
+            Ok(results)
+        },
+    );
+    assert!(result.is_err(), "Must return Err when downloaded bytes < expected file size: {result:?}");
+    assert!(!path.exists(), "Must not publish or leave corrupt partial file on disk");
+}
+

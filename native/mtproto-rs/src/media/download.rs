@@ -144,13 +144,7 @@ pub(crate) fn bound_download_window() -> Option<DownloadWindow> {
 pub(crate) fn configured_download_window(profile: DownloadProfile) -> DownloadWindow {
     let maximum = download_window(profile);
     let policy = crate::transfer_policy::current();
-    let chunk = if policy.is_chunk_owned() {
-        maximum.chunk.min(policy.chunk_size())
-    } else if maximum.chunk >= FAST_CHUNK {
-        maximum.chunk
-    } else {
-        maximum.chunk.min(policy.chunk_size())
-    };
+    let chunk = maximum.chunk.min(policy.chunk_size());
     let in_flight = if policy.is_pipeline_owned() {
         maximum.in_flight.min(policy.pipeline_parts())
     } else if maximum.in_flight >= 8 {
@@ -783,7 +777,13 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                                     }
                                 }
                             }
-                            if bytes.len() < chunk as usize || stream {
+                            let is_eof = match media.file_size {
+                                Some(expected) if expected > 0 => {
+                                    part_offset + bytes.len() as i64 >= expected
+                                }
+                                _ => bytes.len() < chunk as usize,
+                            };
+                            if is_eof || stream {
                                 hit_short = true;
                                 last_part = true;
                                 if index < short_or_empty.len() {
@@ -895,7 +895,13 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                                 downloaded_bytes += bytes.len() as i64;
                                 notify_progress(&target_str, downloaded_bytes, 0);
                             }
-                            if bytes.len() < chunk as usize || stream {
+                            let is_eof = match media.file_size {
+                                Some(expected) if expected > 0 => {
+                                    part_offset + bytes.len() as i64 >= expected
+                                }
+                                _ => bytes.len() < chunk as usize,
+                            };
+                            if is_eof || stream {
                                 last_part = true;
                             }
                         }
@@ -942,6 +948,15 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                 next = next_to_request;
             }
         } // 'download
+        if !stream {
+            if let Some(expected) = media.file_size {
+                if expected > 0 && (downloaded_bytes < expected || written_end < expected) {
+                    return Err(MtprotoError::Message(format!(
+                        "download incomplete: received {downloaded_bytes} of {expected} bytes (written_end: {written_end})"
+                    )));
+                }
+            }
+        }
         out.set_len(written_end as u64)
             .map_err(|e| MtprotoError::Message(e.to_string()))?;
         out.flush()
