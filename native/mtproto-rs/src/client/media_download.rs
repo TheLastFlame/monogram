@@ -819,6 +819,134 @@ pub(crate) fn split_even_odd_request_indices(
     (even, odd)
 }
 
+fn invoke_media_batch_even_odd(
+    client: &Client,
+    snap_a: &mut tellers_mtproto_session::Snapshot,
+    slot_a: &mut Option<crate::rpc::LiveTransport>,
+    snap_b: Option<&mut tellers_mtproto_session::Snapshot>,
+    slot_b: Option<&mut Option<crate::rpc::LiveTransport>>,
+    api_id: i32,
+    requests: Vec<tellers_mtproto::latest::api::UploadGetFileRequest>,
+    on_chunk: &mut (dyn FnMut(
+        usize,
+        Result<tellers_mtproto::latest::api::UploadFile, MtprotoError>,
+    ) -> Option<tellers_mtproto::latest::api::UploadGetFileRequest> + Send),
+) -> Result<Vec<Result<tellers_mtproto::latest::api::UploadFile, MtprotoError>>, MtprotoError> {
+    let Some(first) = requests.first() else {
+        return Ok(Vec::new());
+    };
+    let offsets: Vec<i64> = requests.iter().map(|r| r.offset).collect();
+    let (even_idx, odd_idx) = split_even_odd_request_indices(&offsets, first.limit);
+    let even_reqs: Vec<_> = even_idx.iter().map(|i| requests[*i].clone()).collect();
+    let odd_reqs: Vec<_> = odd_idx.iter().map(|i| requests[*i].clone()).collect();
+    if snap_b.is_none() || slot_b.is_none() || odd_reqs.is_empty() || even_reqs.is_empty() {
+        return with_client_transport(client, slot_a, || {
+            crate::api_invoke::invoke_api_batch_without_updates_streaming(
+                snap_a, api_id, requests, on_chunk,
+            )
+        });
+    }
+    let snap_b = snap_b.unwrap();
+    let slot_b = slot_b.unwrap();
+    let mut snap_a_t = snap_a.clone();
+    let mut snap_b_t = snap_b.clone();
+    let mut slot_a_t = slot_a.take();
+    let mut slot_b_t = slot_b.take();
+
+    let total_initial = requests.len();
+    let on_chunk_state = parking_lot::Mutex::new((on_chunk, total_initial));
+
+    let joined = std::thread::scope(|scope| {
+        let even_h = scope.spawn(|| {
+            let mut local_map = even_idx.clone();
+            let res = with_client_transport(client, &mut slot_a_t, || {
+                crate::api_invoke::invoke_api_batch_without_updates_streaming::<
+                    _,
+                    tellers_mtproto::latest::api::UploadFile,
+                >(
+                    &mut snap_a_t,
+                    api_id,
+                    even_reqs,
+                    &mut |local_idx, res| {
+                        let global_idx = *local_map.get(local_idx)?;
+                        let mut state = on_chunk_state.lock();
+                        let next = (state.0)(global_idx, res);
+                        if next.is_some() {
+                            let next_global = state.1;
+                            state.1 += 1;
+                            local_map.push(next_global);
+                        }
+                        next
+                    },
+                )
+            });
+            (res, local_map)
+        });
+
+        let odd_h = scope.spawn(|| {
+            let mut local_map = odd_idx.clone();
+            let res = with_client_transport(client, &mut slot_b_t, || {
+                crate::api_invoke::invoke_api_batch_without_updates_streaming::<
+                    _,
+                    tellers_mtproto::latest::api::UploadFile,
+                >(
+                    &mut snap_b_t,
+                    api_id,
+                    odd_reqs,
+                    &mut |local_idx, res| {
+                        let global_idx = *local_map.get(local_idx)?;
+                        let mut state = on_chunk_state.lock();
+                        let next = (state.0)(global_idx, res);
+                        if next.is_some() {
+                            let next_global = state.1;
+                            state.1 += 1;
+                            local_map.push(next_global);
+                        }
+                        next
+                    },
+                )
+            });
+            (res, local_map)
+        });
+
+        (even_h.join(), odd_h.join())
+    });
+
+    *snap_a = snap_a_t;
+    *snap_b = snap_b_t;
+    *slot_a = slot_a_t;
+    *slot_b = slot_b_t;
+
+    let (even_res, even_final_map) = joined
+        .0
+        .map_err(|_| MtprotoError::Message("even media lane thread panicked".into()))?;
+    let even_res = even_res?;
+    let (odd_res, odd_final_map) = joined
+        .1
+        .map_err(|_| MtprotoError::Message("odd media lane thread panicked".into()))?;
+    let odd_res = odd_res?;
+
+    let total_results = on_chunk_state.lock().1;
+    let mut merged: Vec<Option<Result<tellers_mtproto::latest::api::UploadFile, MtprotoError>>> =
+        (0..total_results).map(|_| None).collect();
+
+    for (res, global_idx) in even_res.into_iter().zip(even_final_map) {
+        if global_idx < merged.len() {
+            merged[global_idx] = Some(res);
+        }
+    }
+    for (res, global_idx) in odd_res.into_iter().zip(odd_final_map) {
+        if global_idx < merged.len() {
+            merged[global_idx] = Some(res);
+        }
+    }
+
+    Ok(merged
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err(MtprotoError::Message("missing media part".into()))))
+        .collect())
+}
+
 pub(crate) fn download_media_range_on_lane_dc(
     handle: u64,
     client: &Client,
@@ -832,6 +960,11 @@ pub(crate) fn download_media_range_on_lane_dc(
     let _span = crate::perf::span("media_file");
     let staged = media::StagedDownload::new(dest)?;
     let mut io = lock_media_lane(client)?;
+    let mut io2: Option<LaneLease<'_>> = if media.file_size.is_none() || media.file_size.unwrap_or(0) > 128 * 1024 {
+        try_lock_media_lane(client)
+    } else {
+        None
+    };
     if !session_lease_valid(&client.data.lock(), home.session_id) {
         return Err(expired_session_lease());
     }
@@ -848,8 +981,20 @@ pub(crate) fn download_media_range_on_lane_dc(
         MediaLanePrep::Replaced => io.transport = None,
         MediaLanePrep::Reuse => {}
     }
+    if let Some(second) = io2.as_mut() {
+        match prepare_media_lane_snapshot(&mut second.snapshot, home, target_dc) {
+            MediaLanePrep::NeedExport => {
+                second.snapshot = fork_session(&io.snapshot);
+                second.transport = None;
+            }
+            MediaLanePrep::Replaced => second.transport = None,
+            MediaLanePrep::Reuse => {}
+        }
+    }
     let mut media_snap = io.snapshot.clone();
     let mut slot = io.transport.take();
+    let mut media_snap2 = io2.as_ref().map(|lane| lane.snapshot.clone());
+    let mut slot2 = io2.as_mut().map(|lane| lane.transport.take());
     crate::rpc::clear_new_session_metadata();
     // Timeout is per window, not the whole file. Streaming idle-extends while parts arrive.
     let path = {
@@ -864,12 +1009,16 @@ pub(crate) fn download_media_range_on_lane_dc(
             |_init_first, requests, on_chunk| {
                 media::check_transfer_flood(lane_dc, media::TransferClass::Download)?;
                 crate::rpc::with_rpc_timeout_secs(45, || {
-                    with_client_transport(client, &mut slot, || {
-                        crate::api_invoke::invoke_api_batch_without_updates_streaming::<
-                            _,
-                            tellers_mtproto::latest::api::UploadFile,
-                        >(&mut media_snap, api_id, requests, on_chunk)
-                    })
+                    invoke_media_batch_even_odd(
+                        client,
+                        &mut media_snap,
+                        &mut slot,
+                        media_snap2.as_mut(),
+                        slot2.as_mut(),
+                        api_id,
+                        requests,
+                        on_chunk,
+                    )
                 })
             },
         )
@@ -877,7 +1026,14 @@ pub(crate) fn download_media_range_on_lane_dc(
     io.snapshot = media_snap.clone();
     // FILE_REFERENCE / transport errors must not park this TCP for the next file.
     io.transport = if path.is_ok() { slot } else { None };
+    if let Some(second) = io2.as_mut() {
+        if let Some(snap2) = media_snap2 {
+            second.snapshot = snap2;
+        }
+        second.transport = if path.is_ok() { slot2.flatten() } else { None };
+    }
     drop(io);
+    drop(io2);
     if let Ok(client) = get_client(handle) {
         schedule_file_cleanup(&client);
     }

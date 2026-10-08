@@ -622,7 +622,7 @@ pub(crate) fn download_media_range_batched_streaming(
     fetch_batch: impl FnMut(
         bool,
         Vec<UploadGetFileRequest>,
-        &mut dyn FnMut(usize, Result<UploadFile, MtprotoError>) -> Option<UploadGetFileRequest>,
+        &mut (dyn FnMut(usize, Result<UploadFile, MtprotoError>) -> Option<UploadGetFileRequest> + Send),
     ) -> Result<Vec<Result<UploadFile, MtprotoError>>, MtprotoError>,
 ) -> Result<String, MtprotoError> {
     download_media_range_batched_streaming_capped(
@@ -651,7 +651,7 @@ pub(crate) fn download_media_range_batched_streaming_capped(
     mut fetch_batch: impl FnMut(
         bool,
         Vec<UploadGetFileRequest>,
-        &mut dyn FnMut(usize, Result<UploadFile, MtprotoError>) -> Option<UploadGetFileRequest>,
+        &mut (dyn FnMut(usize, Result<UploadFile, MtprotoError>) -> Option<UploadGetFileRequest> + Send),
     ) -> Result<Vec<Result<UploadFile, MtprotoError>>, MtprotoError>,
 ) -> Result<String, MtprotoError> {
     let _chunk_guard = DownloadWindowGuard {
