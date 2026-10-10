@@ -53,6 +53,9 @@ pub struct ClientSession {
     /// Connected to Telegram test DCs (`99966XYYYY`).
     #[serde(default)]
     pub test_dc: bool,
+    /// Persistent master auth keys for foreign datacenters (dc_id -> 256-byte auth key).
+    #[serde(default)]
+    pub dc_auth_keys: HashMap<i32, Vec<u8>>,
 }
 
 pub fn media_key(chat_id: i64, message_id: i32) -> String {
@@ -131,6 +134,7 @@ impl FileSessionStore {
             logout_tokens: Vec::new(),
             new_session: None,
             test_dc: false,
+            dc_auth_keys: HashMap::new(),
         };
         if !encrypted && key.is_some() {
             self.save(&session)?;
