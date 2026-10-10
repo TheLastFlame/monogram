@@ -99,7 +99,7 @@ impl TransferPolicy {
                 return Err(crate::MtprotoError::Message(error.to_string()));
             }
             let limits = *self.queue_limits.lock();
-            let limit = if large { limits.1.min(2) } else { limits.0 };
+            let limit = if large { limits.1 } else { limits.0 };
             let count = active.counts.get(&(dc, large)).copied().unwrap_or(0);
             let best = active
                 .waiters

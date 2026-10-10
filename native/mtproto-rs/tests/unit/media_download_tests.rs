@@ -16,16 +16,28 @@ use tellers_mtproto::latest::api::{
 };
 
 #[test]
-fn stale_staging_preserves_existing_destination_and_removes_partial_bytes() {
+fn stale_staging_preserves_partial_bytes_for_resuming_and_cleans_on_cancel() {
     let dest = std::env::temp_dir().join(format!("monogram-staging-{}", std::process::id()));
     fs::write(&dest, b"previous").unwrap();
     let staged = StagedDownload::new(&dest).unwrap();
     let path = staged.path().to_owned();
+    let parts_path = staged.parts_path().to_owned();
     fs::write(&path, b"uncommitted").unwrap();
+    fs::write(&parts_path, b"meta").unwrap();
     drop(staged);
-    assert!(!path.exists());
+    // Preserved for resume on normal uncommitted drop
+    assert!(path.exists());
+    assert!(parts_path.exists());
     assert_eq!(fs::read(&dest).unwrap(), b"previous");
-    fs::remove_file(dest).unwrap();
+
+    // Cleans up when explicitly cancelled
+    fs::write(cancel_marker(&dest), []).unwrap();
+    let staged_cancel = StagedDownload::new(&dest).unwrap();
+    drop(staged_cancel);
+    assert!(!path.exists());
+    assert!(!parts_path.exists());
+    let _ = fs::remove_file(cancel_marker(&dest));
+    let _ = fs::remove_file(dest);
 }
 
 #[test]
@@ -51,6 +63,34 @@ fn successful_staging_publishes_complete_file() {
     assert!(!path.exists());
     assert_eq!(fs::read(&dest).unwrap(), b"complete");
     fs::remove_file(dest).unwrap();
+}
+
+#[test]
+fn parts_meta_roundtrip_matches_nekogram_format() {
+    let parts_path = std::env::temp_dir().join(format!("test-parts-{}", std::process::id()));
+    let meta = FilePartsMeta {
+        not_loaded: vec![
+            ByteRange { start: 1024, end: 4096 },
+            ByteRange { start: 8192, end: 16384 },
+        ],
+    };
+    meta.save(&parts_path).unwrap();
+    let loaded = FilePartsMeta::load(&parts_path).unwrap();
+    assert_eq!(loaded.not_loaded.len(), 2);
+    assert_eq!(loaded.not_loaded[0], ByteRange { start: 1024, end: 4096 });
+    assert_eq!(loaded.not_loaded[1], ByteRange { start: 8192, end: 16384 });
+
+    // Verify raw binary matches Nekogram big-endian layout
+    let raw = fs::read(&parts_path).unwrap();
+    assert_eq!(raw.len(), 4 + 2 * 16);
+    let count = i32::from_be_bytes(raw[0..4].try_into().unwrap());
+    assert_eq!(count, 2);
+    let start0 = i64::from_be_bytes(raw[4..12].try_into().unwrap());
+    let end0 = i64::from_be_bytes(raw[12..20].try_into().unwrap());
+    assert_eq!(start0, 1024);
+    assert_eq!(end0, 4096);
+
+    let _ = fs::remove_file(parts_path);
 }
 
 #[test]

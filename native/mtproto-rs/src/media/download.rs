@@ -576,55 +576,109 @@ pub(crate) fn download_cancelled(dest_path: &Path) -> bool {
     cancel_marker(dest_path).exists()
 }
 
-/// The caller publishes under its session lease; dropping any failed or stale
-/// download removes only its own staging file, never a previously cached file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ByteRange {
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FilePartsMeta {
+    pub not_loaded: Vec<ByteRange>,
+}
+
+impl FilePartsMeta {
+    pub(crate) fn load(path: &Path) -> Option<Self> {
+        let bytes = fs::read(path).ok()?;
+        if bytes.len() < 4 {
+            return None;
+        }
+        let count = i32::from_be_bytes(bytes[0..4].try_into().ok()?) as usize;
+        if bytes.len() != 4 + count * 16 {
+            return None;
+        }
+        let mut not_loaded = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = 4 + i * 16;
+            let start = i64::from_be_bytes(bytes[offset..offset + 8].try_into().ok()?);
+            let end = i64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().ok()?);
+            if start < 0 || end < start {
+                return None;
+            }
+            not_loaded.push(ByteRange { start, end });
+        }
+        Some(Self { not_loaded })
+    }
+
+    pub(crate) fn save(&self, path: &Path) -> std::io::Result<()> {
+        let count = self.not_loaded.len() as i32;
+        let mut buf = Vec::with_capacity(4 + self.not_loaded.len() * 16);
+        buf.extend_from_slice(&count.to_be_bytes());
+        for r in &self.not_loaded {
+            buf.extend_from_slice(&r.start.to_be_bytes());
+            buf.extend_from_slice(&r.end.to_be_bytes());
+        }
+        fs::write(path, buf)
+    }
+}
+
+/// The caller publishes under its session lease; staging files (.temp and .temp.parts)
+/// persist across retries/network drops and are only wiped on explicit cancellation.
 pub(crate) struct StagedDownload {
     path: PathBuf,
+    parts_path: PathBuf,
+    destination: PathBuf,
 }
 
 impl StagedDownload {
     pub(crate) fn new(destination: &Path) -> Result<Self, MtprotoError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|e| MtprotoError::Message(e.to_string()))?;
         }
-        loop {
-            let mut name = destination.as_os_str().to_os_string();
-            name.push(format!(
-                ".{}.{}.part",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let path = PathBuf::from(name);
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(MtprotoError::Message(e.to_string())),
-            }
-        }
+        let mut temp_name = destination.as_os_str().to_os_string();
+        temp_name.push(".temp");
+        let path = PathBuf::from(temp_name);
+
+        let mut parts_name = destination.as_os_str().to_os_string();
+        parts_name.push(".temp.parts");
+        let parts_path = PathBuf::from(parts_name);
+
+        Ok(Self {
+            path,
+            parts_path,
+            destination: destination.to_path_buf(),
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
+    pub(crate) fn parts_path(&self) -> &Path {
+        &self.parts_path
+    }
+
     pub(crate) fn publish(self, destination: &Path) -> Result<String, MtprotoError> {
         if download_cancelled(destination) {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(&self.parts_path);
             return Err(MtprotoError::Message("cancelled".into()));
         }
+        if destination.exists() {
+            let _ = fs::remove_file(destination);
+        }
         fs::rename(&self.path, destination).map_err(|e| MtprotoError::Message(e.to_string()))?;
+        let _ = fs::remove_file(&self.parts_path);
         Ok(destination.display().to_string())
     }
 }
 
 impl Drop for StagedDownload {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if download_cancelled(&self.destination) {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(&self.parts_path);
+        }
     }
 }
 
@@ -745,34 +799,70 @@ pub(crate) fn download_media_range_batched_streaming_capped(
         fs::create_dir_all(parent).map_err(|e| MtprotoError::Message(e.to_string()))?;
     }
     let result = (|| -> Result<(), MtprotoError> {
-        let mut out =
-            fs::File::create(dest_path).map_err(|e| MtprotoError::Message(e.to_string()))?;
+        let parts_path = PathBuf::from(format!("{}.temp.parts", cancellation_path.display()));
+        let mut out = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(dest_path)
+            .map_err(|e| MtprotoError::Message(e.to_string()))?;
+        let stream = offset.is_some();
+        let mut initial_offset = offset.unwrap_or(0);
+        if !stream {
+            if let Some(meta) = FilePartsMeta::load(&parts_path) {
+                if let Some(first_missing) = meta.not_loaded.first() {
+                    let file_len = out.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                    let safe_offset = first_missing.start.min(file_len);
+                    if safe_offset > 0 {
+                        let safe_aligned = safe_offset - (safe_offset % i64::from(DEFAULT_CHUNK));
+                        if safe_aligned > 0 {
+                            initial_offset = safe_aligned;
+                        }
+                    }
+                }
+            }
+        }
+
+        if initial_offset > 0 {
+            use std::io::{Seek, SeekFrom};
+            let _ = out.set_len(initial_offset as u64);
+            let _ = out.seek(SeekFrom::Start(initial_offset as u64));
+        } else if !stream {
+            use std::io::{Seek, SeekFrom};
+            let _ = out.set_len(0);
+            let _ = out.seek(SeekFrom::Start(0));
+        }
+
         let window = crate::transfer_policy::current().floods.lock().window(
             dc_id,
             TransferClass::Download,
             std::time::Instant::now(),
             DownloadWindow {
-                chunk: resolve_chunk(offset),
+                chunk: resolve_chunk(Some(initial_offset).filter(|_| initial_offset > 0).or(offset)),
                 in_flight: parts_in_flight.max(1),
             },
         );
         FORCED_CHUNK.with(|cell| cell.set(window.chunk));
         let mut width = window.in_flight;
-        let stream = offset.is_some();
-        let mut next = offset.unwrap_or(0);
+        let mut next = initial_offset;
         let mut retried_limit = false;
         let mut timeout_retries = 0u8;
-        let mut written_end = 0i64;
-        let mut downloaded_bytes = offset.unwrap_or(0);
+        let mut written_end = initial_offset;
+        let mut downloaded_bytes = initial_offset;
         let mut counted_offsets = HashSet::new();
         let mut first_batch = true;
+        let mut last_saved_offset = initial_offset;
         let target_str = cancellation_path.display().to_string();
+
+        if initial_offset > 0 {
+            notify_progress(&target_str, downloaded_bytes, media.file_size.unwrap_or(0));
+        }
         'download: loop {
             width = crate::transfer_policy::current().floods.lock().window(
                 dc_id,
                 TransferClass::Download,
                 std::time::Instant::now(),
-                DownloadWindow { chunk: resolve_chunk(offset), in_flight: parts_in_flight.max(1) },
+                DownloadWindow { chunk: resolve_chunk(Some(next).filter(|_| next > 0).or(offset)), in_flight: parts_in_flight.max(1) },
             ).in_flight.min(if retried_limit { width } else { parts_in_flight.max(1) });
             let chunk = resolve_chunk(Some(next).filter(|_| next > 0).or(offset));
             let batch = if stream {
@@ -914,7 +1004,7 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                             timeout_retries += 1;
                             next = first_missing_offset(
                                 &counted_offsets,
-                                offset.unwrap_or(0),
+                                initial_offset,
                                 next_to_request,
                                 chunk,
                             );
@@ -998,7 +1088,7 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                                 timeout_retries += 1;
                                 next = first_missing_offset(
                                     &counted_offsets,
-                                    offset.unwrap_or(0),
+                                    initial_offset,
                                     next_to_request,
                                     chunk,
                                 );
@@ -1015,10 +1105,27 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                 // Continue at the first hole instead of the cursor those refills advanced.
                 next = first_missing_offset(
                     &counted_offsets,
-                    offset.unwrap_or(0),
+                    initial_offset,
                     next_to_request,
                     chunk,
                 );
+                let contiguous = first_missing_offset(
+                    &counted_offsets,
+                    initial_offset,
+                    written_end,
+                    chunk,
+                );
+                if contiguous > last_saved_offset {
+                    let total = media.file_size.unwrap_or(0);
+                    let meta = FilePartsMeta {
+                        not_loaded: vec![ByteRange {
+                            start: contiguous,
+                            end: total,
+                        }],
+                    };
+                    let _ = meta.save(&parts_path);
+                    last_saved_offset = contiguous;
+                }
             }
         } // 'download
         if !stream {
@@ -1034,12 +1141,17 @@ pub(crate) fn download_media_range_batched_streaming_capped(
             .map_err(|e| MtprotoError::Message(e.to_string()))?;
         out.flush()
             .map_err(|e| MtprotoError::Message(e.to_string()))?;
+        let _ = fs::remove_file(&parts_path);
         Ok(())
     })();
     match result {
         Ok(()) => Ok(dest_path.display().to_string()),
         Err(err) => {
-            let _ = fs::remove_file(dest_path);
+            if download_cancelled(cancellation_path) {
+                let _ = fs::remove_file(dest_path);
+                let parts_path = PathBuf::from(format!("{}.temp.parts", cancellation_path.display()));
+                let _ = fs::remove_file(parts_path);
+            }
             Err(err)
         }
     }

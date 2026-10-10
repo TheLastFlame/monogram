@@ -101,8 +101,10 @@ pub fn set_dispatch_class(class: i32) {
 /// "Faster downloads" setting: media lanes (1..=8) and parts in flight (1..=16).
 #[uniffi::export]
 pub fn set_download_concurrency(lanes: i32, parts: i32) {
-    scheduler::set_active_media_lanes(lanes.max(1) as usize);
+    let lanes_cnt = lanes.max(1) as usize;
+    scheduler::set_active_media_lanes(lanes_cnt);
     client::set_pipeline_parts(parts.max(1) as usize);
+    *crate::transfer_policy::current().queue_limits.lock() = (lanes_cnt, lanes_cnt);
 }
 
 #[uniffi::export]
