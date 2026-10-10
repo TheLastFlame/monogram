@@ -80,21 +80,27 @@ pub(crate) fn ensure_auth_key(state: &mut ClientState) -> Result<(), MtprotoErro
 }
 
 pub(crate) fn copy_authorization_to_dc(
-    home: &mut Snapshot,
-    api_id: i32,
+    state: &mut ClientState,
     target_dc: i32,
 ) -> Result<Snapshot, MtprotoError> {
     use tellers_mtproto::latest::api::{
         AuthAuthorization, AuthExportAuthorizationRequest, AuthExportedAuthorization,
         AuthImportAuthorizationRequest,
     };
+    if let Some(cached_key) = state.dc_auth_keys.get(&target_dc) {
+        let mut dest = fork_session(&state.snapshot);
+        dest.dc_id = target_dc;
+        dest.auth_key = Some(cached_key.clone());
+        dest.server_salt = 0;
+        return Ok(dest);
+    }
     let exported: AuthExportedAuthorization = crate::api_invoke::invoke_api(
-        home,
-        api_id,
+        &mut state.snapshot,
+        state.api_id,
         AuthExportAuthorizationRequest { dc_id: target_dc },
     )?;
     let AuthExportedAuthorization::AuthExportedAuthorization(exp) = exported;
-    let mut dest = fork_session(home);
+    let mut dest = fork_session(&state.snapshot);
     dest.dc_id = target_dc;
     dest.auth_key = None;
     dest.server_salt = 0;
@@ -102,7 +108,7 @@ pub(crate) fn copy_authorization_to_dc(
     ensure_auth_key_on(&mut dest)?;
     let _: AuthAuthorization = crate::api_invoke::invoke_api(
         &mut dest,
-        api_id,
+        state.api_id,
         AuthImportAuthorizationRequest {
             id: exp.id,
             bytes: exp.bytes,
@@ -110,6 +116,10 @@ pub(crate) fn copy_authorization_to_dc(
     )?;
     // The destination snapshot leaves this lane; never retain its TCP here.
     crate::rpc::drop_live_transport();
+    if let Some(imported_key) = dest.auth_key.clone() {
+        state.dc_auth_keys.insert(target_dc, imported_key);
+        let _ = persist(state);
+    }
     Ok(dest)
 }
 
@@ -199,8 +209,7 @@ pub(crate) fn ensure_ready_after_migrate(
                     // exportAuthorization/importAuthorization. Dropping the
                     // home auth key here turns a normal USER/NETWORK_MIGRATE
                     // into an unnecessary logout and breaks all update lanes.
-                    let mut home = state.snapshot.clone();
-                    let destination = copy_authorization_to_dc(&mut home, state.api_id, dc)?;
+                    let destination = copy_authorization_to_dc(state, dc)?;
                     state.snapshot = destination;
                     // Authorization moved, but these are still the same
                     // account's applied update sequences.

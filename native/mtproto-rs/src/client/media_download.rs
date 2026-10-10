@@ -1027,7 +1027,7 @@ pub(crate) fn download_media_range_on_lane_dc(
                     if !home_lease_ok(state, home.session_id) {
                         return Err(expired_session_lease());
                     }
-                    copy_authorization_to_dc(&mut state.snapshot, api_id, target_dc)
+                    copy_authorization_to_dc(state, target_dc)
                 })?;
                 io.transport = None;
             }
