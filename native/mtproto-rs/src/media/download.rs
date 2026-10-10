@@ -660,8 +660,6 @@ impl StagedDownload {
 
     pub(crate) fn publish(self, destination: &Path) -> Result<String, MtprotoError> {
         if download_cancelled(destination) {
-            let _ = fs::remove_file(&self.path);
-            let _ = fs::remove_file(&self.parts_path);
             return Err(MtprotoError::Message("cancelled".into()));
         }
         if destination.exists() {
@@ -675,10 +673,9 @@ impl StagedDownload {
 
 impl Drop for StagedDownload {
     fn drop(&mut self) {
-        if download_cancelled(&self.destination) {
-            let _ = fs::remove_file(&self.path);
-            let _ = fs::remove_file(&self.parts_path);
-        }
+        // Incomplete downloads (.temp and .temp.parts) are preserved on disk
+        // so that pausing, stopping, network drops, and app restarts resume from
+        // the last contiguous byte without restarting from 0.
     }
 }
 
@@ -820,6 +817,14 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                         }
                     }
                 }
+            } else {
+                let file_len = out.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                if file_len > 0 {
+                    let safe_aligned = file_len - (file_len % i64::from(DEFAULT_CHUNK));
+                    if safe_aligned > 0 {
+                        initial_offset = safe_aligned;
+                    }
+                }
             }
         }
 
@@ -939,6 +944,24 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                                             stop_refill = true;
                                         }
                                         notify_progress(&target_str, downloaded_bytes, 0);
+
+                                        let contiguous = first_missing_offset(
+                                            &counted_offsets,
+                                            initial_offset,
+                                            written_end,
+                                            chunk,
+                                        );
+                                        if contiguous > last_saved_offset {
+                                            let total = media.file_size.unwrap_or(0);
+                                            let meta = FilePartsMeta {
+                                                not_loaded: vec![ByteRange {
+                                                    start: contiguous,
+                                                    end: total,
+                                                }],
+                                            };
+                                            let _ = meta.save(&parts_path);
+                                            last_saved_offset = contiguous;
+                                        }
                                     }
                                     if index < written_parts.len() {
                                         written_parts[index] = true;
@@ -1056,6 +1079,24 @@ pub(crate) fn download_media_range_batched_streaming_capped(
                             if counted_offsets.insert(part_offset) {
                                 downloaded_bytes += bytes.len() as i64;
                                 notify_progress(&target_str, downloaded_bytes, 0);
+
+                                let contiguous = first_missing_offset(
+                                    &counted_offsets,
+                                    initial_offset,
+                                    written_end,
+                                    chunk,
+                                );
+                                if contiguous > last_saved_offset {
+                                    let total = media.file_size.unwrap_or(0);
+                                    let meta = FilePartsMeta {
+                                        not_loaded: vec![ByteRange {
+                                            start: contiguous,
+                                            end: total,
+                                        }],
+                                    };
+                                    let _ = meta.save(&parts_path);
+                                    last_saved_offset = contiguous;
+                                }
                             }
                             if bytes.len() < chunk as usize || stream {
                                 last_part = true;
@@ -1147,11 +1188,7 @@ pub(crate) fn download_media_range_batched_streaming_capped(
     match result {
         Ok(()) => Ok(dest_path.display().to_string()),
         Err(err) => {
-            if download_cancelled(cancellation_path) {
-                let _ = fs::remove_file(dest_path);
-                let parts_path = PathBuf::from(format!("{}.temp.parts", cancellation_path.display()));
-                let _ = fs::remove_file(parts_path);
-            }
+            // Partial downloads (.temp and .temp.parts) are preserved on disk for resume.
             Err(err)
         }
     }

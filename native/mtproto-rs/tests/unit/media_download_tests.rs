@@ -16,7 +16,7 @@ use tellers_mtproto::latest::api::{
 };
 
 #[test]
-fn stale_staging_preserves_partial_bytes_for_resuming_and_cleans_on_cancel() {
+fn stale_staging_preserves_partial_bytes_for_resuming_across_cancellations() {
     let dest = std::env::temp_dir().join(format!("monogram-staging-{}", std::process::id()));
     fs::write(&dest, b"previous").unwrap();
     let staged = StagedDownload::new(&dest).unwrap();
@@ -30,27 +30,34 @@ fn stale_staging_preserves_partial_bytes_for_resuming_and_cleans_on_cancel() {
     assert!(parts_path.exists());
     assert_eq!(fs::read(&dest).unwrap(), b"previous");
 
-    // Cleans up when explicitly cancelled
+    // Preserved across cancellations as well so downloads can resume
     fs::write(cancel_marker(&dest), []).unwrap();
     let staged_cancel = StagedDownload::new(&dest).unwrap();
     drop(staged_cancel);
-    assert!(!path.exists());
-    assert!(!parts_path.exists());
+    assert!(path.exists());
+    assert!(parts_path.exists());
     let _ = fs::remove_file(cancel_marker(&dest));
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&parts_path);
     let _ = fs::remove_file(dest);
 }
 
 #[test]
-fn cancel_before_publication_cleans_staging_without_publishing() {
+fn cancel_before_publication_leaves_staging_without_publishing() {
     let dest = std::env::temp_dir().join(format!("monogram-publish-cancel-{}", std::process::id()));
     let staged = StagedDownload::new(&dest).unwrap();
     let path = staged.path().to_owned();
+    let parts_path = staged.parts_path().to_owned();
     fs::write(&path, b"complete").unwrap();
+    fs::write(&parts_path, b"parts").unwrap();
     fs::write(cancel_marker(&dest), []).unwrap();
     assert!(staged.publish(&dest).is_err());
-    assert!(!path.exists());
+    assert!(path.exists());
+    assert!(parts_path.exists());
     assert!(!dest.exists());
-    fs::remove_file(cancel_marker(&dest)).unwrap();
+    let _ = fs::remove_file(cancel_marker(&dest));
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&parts_path);
 }
 
 #[test]
