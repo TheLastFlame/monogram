@@ -31,6 +31,7 @@ fn logout_clears_unauthorized_local_session_without_network() {
         perm_auth_key: None,
         perm_salt: 0,
         perm_session_id: 0,
+        dc_auth_keys: HashMap::new(),
     };
     persist(&state).expect("seed session");
     assert!(path.exists());

@@ -1021,27 +1021,49 @@ pub(crate) fn download_media_range_on_lane_dc(
         && io.snapshot.dc_id == target_dc
         && io.snapshot.auth_key.as_ref() != home.auth_key.as_ref();
     if !already_temp {
-        match prepare_media_lane_snapshot(&mut io.snapshot, home, target_dc) {
-            MediaLanePrep::NeedExport => {
-                io.snapshot = with_client_mut(handle, |state| {
-                    if !home_lease_ok(state, home.session_id) {
-                        return Err(expired_session_lease());
-                    }
-                    copy_authorization_to_dc(state, target_dc)
-                })?;
-                io.transport = None;
+        let cached_temp = {
+            let d = client.data.lock();
+            d.dc_temp_auth
+                .get(&target_dc)
+                .filter(|t| t.temp_expires_at > now)
+                .cloned()
+        };
+        if let Some(cached) = cached_temp {
+            io.snapshot = fork_session(&cached.snapshot);
+            io.temp_expires_at = cached.temp_expires_at;
+            io.perm_key = Some(cached.perm_key);
+            io.transport = None;
+        } else {
+            match prepare_media_lane_snapshot(&mut io.snapshot, home, target_dc) {
+                MediaLanePrep::NeedExport => {
+                    io.snapshot = with_client_mut(handle, |state| {
+                        if !home_lease_ok(state, home.session_id) {
+                            return Err(expired_session_lease());
+                        }
+                        copy_authorization_to_dc(state, target_dc)
+                    })?;
+                    io.transport = None;
+                }
+                MediaLanePrep::Replaced => io.transport = None,
+                MediaLanePrep::Reuse => {}
             }
-            MediaLanePrep::Replaced => io.transport = None,
-            MediaLanePrep::Reuse => {}
-        }
-        if let Some(key) = io.snapshot.auth_key.clone() {
-            io.perm_key = Some(key.clone());
-            let offset = io.snapshot.time_offset_micros;
-            let dc = io.snapshot.dc_id;
-            if let Ok(bound) = crate::auth::bind_temp::negotiate_bound_temp(&key, dc, offset) {
-                io.snapshot = bound.snapshot;
-                io.temp_expires_at = bound.expires_at;
-                io.transport = None;
+            if let Some(key) = io.snapshot.auth_key.clone() {
+                io.perm_key = Some(key.clone());
+                let offset = io.snapshot.time_offset_micros;
+                let dc = io.snapshot.dc_id;
+                if let Ok(bound) = crate::auth::bind_temp::negotiate_bound_temp(&key, dc, offset) {
+                    client.data.lock().dc_temp_auth.insert(
+                        target_dc,
+                        DcTempAuth {
+                            snapshot: bound.snapshot.clone(),
+                            temp_expires_at: bound.expires_at,
+                            perm_key: key,
+                        },
+                    );
+                    io.snapshot = bound.snapshot;
+                    io.temp_expires_at = bound.expires_at;
+                    io.transport = None;
+                }
             }
         }
     }
@@ -1091,9 +1113,31 @@ pub(crate) fn download_media_range_on_lane_dc(
                         let Some(mut second) = try_lock_second_media_lane(&worker_client) else { return false; };
                         if !session_lease_valid(&worker_client.data.lock(), expected_session) { return false; }
                         if download_temp_ready(&second, target_dc, home_key.as_deref()) { return true; }
+                        let cached_temp = {
+                            let d = worker_client.data.lock();
+                            d.dc_temp_auth
+                                .get(&target_dc)
+                                .filter(|t| t.temp_expires_at > crate::auth::bind_temp::unix_now())
+                                .cloned()
+                        };
+                        if let Some(cached) = cached_temp {
+                            second.perm_key = Some(cached.perm_key);
+                            second.snapshot = fork_session(&cached.snapshot);
+                            second.temp_expires_at = cached.temp_expires_at;
+                            second.transport = None;
+                            return true;
+                        }
                         let Ok(bound) = crate::auth::bind_temp::negotiate_bound_temp(&key, target_dc, time_offset) else { return false; };
                         if crate::request_control::check().is_err()
                             || !session_lease_valid(&worker_client.data.lock(), expected_session) { return false; }
+                        worker_client.data.lock().dc_temp_auth.insert(
+                            target_dc,
+                            DcTempAuth {
+                                snapshot: bound.snapshot.clone(),
+                                temp_expires_at: bound.expires_at,
+                                perm_key: key.clone(),
+                            },
+                        );
                         second.perm_key = Some(key);
                         second.snapshot = bound.snapshot;
                         second.temp_expires_at = bound.expires_at;
